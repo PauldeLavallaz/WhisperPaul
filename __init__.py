@@ -1,10 +1,7 @@
 # ComfyUI-OpenAI-Transcribe
 # OpenAI Audio Transcription node for ComfyUI
-# Inputs: audio (AUDIO), api_key (STRING), optional: model/language/temperature
+# Inputs: audio (AUDIO), api_key (STRING), optional: model/language/temperature(STRING)
 # Output: text (STRING) - transcription
-#
-# Model default: gpt-4o-mini-transcribe
-# Endpoint: POST https://api.openai.com/v1/audio/transcriptions
 
 import os
 import requests
@@ -18,12 +15,21 @@ except Exception:
     np = None
 
 
-class OpenAITranscribe:
-    """
-    ComfyUI node that accepts an AUDIO object and calls OpenAI's transcription API.
-    Returns plain text.
-    """
+def _to_float(val, default=0.0):
+    try:
+        if val is None:
+            return default
+        if isinstance(val, (int, float)):
+            return float(val)
+        s = str(val).strip()
+        if s == "":
+            return default
+        return float(s)
+    except Exception:
+        return default
 
+
+class OpenAITranscribe:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -34,7 +40,8 @@ class OpenAITranscribe:
             "optional": {
                 "model": ("STRING", {"multiline": False, "default": "gpt-4o-mini-transcribe"}),
                 "language": ("STRING", {"multiline": False, "default": ""}),  # e.g. "es"; blank = auto
-                "temperature": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.1}),
+                # STRING to avoid Comfy Deploy sending '' for FLOAT
+                "temperature": ("STRING", {"multiline": False, "default": "0"}),
             },
         }
 
@@ -43,16 +50,7 @@ class OpenAITranscribe:
     FUNCTION = "run"
     CATEGORY = "OpenAI/Audio"
 
-    # ---- helpers ----
     def _audio_to_file(self, audio) -> tuple[str, bool]:
-        """
-        Resolve an AUDIO object into a readable file path.
-        Returns (path, should_delete_after_use).
-        Strategy:
-          1) If it's already a path in common keys, use it.
-          2) If it contains raw samples + sample_rate, write a temp WAV.
-        """
-        # 1) pre-existing path in typical keys
         if isinstance(audio, str) and os.path.exists(audio):
             return audio, False
         if isinstance(audio, dict):
@@ -61,7 +59,6 @@ class OpenAITranscribe:
                 if isinstance(p, str) and os.path.exists(p):
                     return p, False
 
-        # 2) build WAV from samples
         samples, sr = None, None
         if isinstance(audio, dict):
             sr = audio.get("sample_rate") or audio.get("sampling_rate") or audio.get("sr") or 44100
@@ -71,48 +68,41 @@ class OpenAITranscribe:
 
         if samples is None:
             raise RuntimeError("AUDIO no contiene path ni samples reconocibles. Pasá un AUDIO válido (con path o samples).")
-
         if np is None:
             raise RuntimeError("Este nodo requiere numpy para serializar AUDIO→WAV. Instalá numpy en el venv de ComfyUI.")
 
-        import numpy as _np
-        arr = _np.asarray(samples)
-        # layout & channels
+        arr = np.asarray(samples)
         if arr.ndim == 1:
             channels = 1
-            arr = arr[None, :]  # (1, T)
+            arr = arr[None, :]
         elif arr.ndim == 2:
             c_first = arr.shape[0] <= arr.shape[1]
             channels = arr.shape[0] if c_first else arr.shape[1]
             if not c_first:
-                arr = arr.T  # (C, T)
+                arr = arr.T
         else:
             raise RuntimeError(f"Formato de samples inesperado: {arr.shape}")
 
-        # to int16 PCM
         if arr.dtype.kind == "f":
-            arr = _np.clip(arr, -1.0, 1.0)
-            pcm = (arr * 32767.0).astype(_np.int16)
-        elif arr.dtype == _np.int16:
+            arr = np.clip(arr, -1.0, 1.0)
+            pcm = (arr * 32767.0).astype(np.int16)
+        elif arr.dtype == np.int16:
             pcm = arr
         else:
-            pcm = arr.astype(_np.int16)
+            pcm = arr.astype(np.int16)
 
         interleaved = pcm.T.reshape(-1)
-
         fd, tmp_path = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
         with wave.open(tmp_path, "wb") as w:
             w.setnchannels(channels)
-            w.setsampwidth(2)  # 16-bit
+            w.setsampwidth(2)
             w.setframerate(int(sr or 44100))
             w.writeframes(interleaved.tobytes())
-
         return tmp_path, True
 
-    # ---- main ----
     def run(self, audio, api_key: str, model: str = "gpt-4o-mini-transcribe",
-            language: str = "", temperature: float = 0.0):
+            language: str = "", temperature: str = "0"):
         key = (api_key or os.getenv("OPENAI_API_KEY") or "").strip()
         if not key:
             raise RuntimeError("OPENAI_API_KEY no seteada. Pasá la API Key en 'api_key' o seteala como variable de entorno.")
@@ -121,12 +111,14 @@ class OpenAITranscribe:
         url = "https://api.openai.com/v1/audio/transcriptions"
         mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
 
+        temp_val = _to_float(temperature, 0.0)
+
         try:
             with open(path, "rb") as f:
                 files = {"file": (os.path.basename(path), f, mime)}
                 data = {
                     "model": model,
-                    "temperature": str(temperature),
+                    "temperature": str(temp_val),
                     "response_format": "text",
                 }
                 if language:
