@@ -1,5 +1,5 @@
 # ComfyUI-OpenAI-Transcribe
-# Robust AUDIO -> file resolver (handles torch Tensors without boolean eval)
+# Robust AUDIO -> file resolver (handles tensors; arbitrary shapes)
 # OpenAI transcription caller. Returns plain text.
 
 import os
@@ -40,6 +40,45 @@ def _first_present(d: dict, keys):
     return None
 
 
+def _to_numpy(a):
+    # Convert torch tensor / list-like to numpy without triggering boolean evaluation
+    if torch is not None and isinstance(a, torch.Tensor):
+        return a.detach().cpu().numpy()
+    if np is not None:
+        return np.asarray(a)
+    raise RuntimeError("numpy es requerido para serializar AUDIO→WAV. Instalá numpy en el venv de ComfyUI.")
+
+
+def _arr_to_channels_last(arr):
+    """
+    Normalize any array to shape (C, T) where:
+    - T is the longest dimension (assume samples)
+    - C is the product of all other dims (batch*channels*...)
+    Examples it handles:
+      (T,) -> (1, T)
+      (C, T) or (T, C)
+      (B, C, T), (C, T, B), (T, C, B), etc.
+    """
+    import numpy as _np
+
+    arr = _to_numpy(arr)
+    if arr.ndim == 0:
+        raise RuntimeError("AUDIO vacío.")
+    if arr.ndim == 1:
+        return arr[_np.newaxis, :]
+
+    # pick the axis with the largest size as sample axis
+    sample_axis = int(arr.shape.index(max(arr.shape)))
+    # move sample axis to the last position
+    arr = _np.moveaxis(arr, sample_axis, -1)  # shape: (..., T)
+
+    # flatten all leading dims into channels
+    T = arr.shape[-1]
+    C = int(_np.prod(arr.shape[:-1])) if arr.ndim > 1 else 1
+    arr = arr.reshape(C, T)
+    return arr
+
+
 class OpenAITranscribe:
     @classmethod
     def INPUT_TYPES(cls):
@@ -62,18 +101,18 @@ class OpenAITranscribe:
 
     # --- helpers ---
     def _audio_to_file(self, audio) -> tuple[str, bool]:
-        # If it's a direct path string
+        # direct path
         if isinstance(audio, str) and os.path.exists(audio):
             return audio, False
 
-        # If dict with a path-like entry
+        # dict with a path
         if isinstance(audio, dict):
             for k in ("path", "filepath", "file", "filename", "temp_path"):
                 p = audio.get(k)
                 if isinstance(p, str) and os.path.exists(p):
                     return p, False
 
-        # Else try to resolve raw samples
+        # raw samples
         samples, sr = None, None
         if isinstance(audio, dict):
             sr = _first_present(audio, ("sample_rate", "sampling_rate", "sr"))
@@ -84,44 +123,24 @@ class OpenAITranscribe:
         if samples is None:
             raise RuntimeError("AUDIO no contiene path ni samples. Pasá un AUDIO válido (con path o samples).")
 
-        # to numpy
-        if torch is not None and isinstance(samples, torch.Tensor):
-            arr = samples.detach().cpu().numpy()
-        elif np is not None:
-            arr = np.asarray(samples)
-        else:
-            raise RuntimeError("Este nodo requiere numpy (o torch) para serializar AUDIO→WAV. Instalá numpy en el venv de ComfyUI.")
-
-        # ensure float or int array
-        if arr.ndim == 1:
-            channels = 1
-            arr = arr[None, :]  # (C=1, T)
-        elif arr.ndim == 2:
-            # Accept (C, T) or (T, C). Assume channels <= 8
-            c_first = arr.shape[0] <= 8
-            channels = arr.shape[0] if c_first else arr.shape[1]
-            if not c_first:
-                arr = arr.T
-        else:
-            raise RuntimeError(f"Formato de samples inesperado: {arr.shape}")
+        arr = _arr_to_channels_last(samples)
 
         # normalize to int16 PCM
+        import numpy as _np
         if arr.dtype.kind == "f":
-            if np is None:
-                raise RuntimeError("numpy es requerido para normalizar audio float.")
-            arr = np.clip(arr, -1.0, 1.0)
-            pcm = (arr * 32767.0).astype(np.int16)
-        elif np is not None and arr.dtype != np.int16:
-            pcm = arr.astype(np.int16)
+            arr = _np.clip(arr, -1.0, 1.0)
+            pcm = (arr * 32767.0).astype(_np.int16)
+        elif arr.dtype != _np.int16:
+            pcm = arr.astype(_np.int16)
         else:
-            pcm = arr  # already int16
+            pcm = arr
 
         interleaved = pcm.T.reshape(-1)
 
         fd, tmp_path = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
         with wave.open(tmp_path, "wb") as w:
-            w.setnchannels(int(channels))
+            w.setnchannels(int(pcm.shape[0]))
             w.setsampwidth(2)  # 16-bit
             w.setframerate(int(sr or 44100))
             w.writeframes(interleaved.tobytes())
@@ -138,6 +157,7 @@ class OpenAITranscribe:
         path, should_cleanup = self._audio_to_file(audio)
         url = "https://api.openai.com/v1/audio/transcriptions"
         mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+
         temp_val = _to_float(temperature, 0.0)
 
         try:
